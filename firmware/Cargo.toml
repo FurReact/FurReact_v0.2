@@ -1,0 +1,33 @@
+[package]
+name    = "solcatears-fw"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "solcatears-fw"
+path = "src/main.rs"
+
+[dependencies]
+embassy-executor       = "0.10"
+embassy-sync           = "0.8"
+embassy-time           = "0.4"
+embedded-io-async      = "0.7"
+esp-backtrace          = { version = "0.19", features = ["esp32s3", "panic-handler", "println"] }
+esp-bootloader-esp-idf = { version = "0.5",  features = ["esp32s3"] }
+esp-hal                = { version = "=1.1.0-rc.0",  features = ["esp32s3", "unstable"] }
+esp-println            = { version = "0.17", default-features = false, features = ["esp32s3", "jtag-serial"] }
+esp-rtos               = { version = "0.3",  features = ["esp32s3", "embassy"] }
+heapless               = "0.8"
+static_cell            = "2.1"
+
+[profile.release]
+opt-level       = "s"
+lto             = "fat"
+codegen-units   = 1
+debug           = true
+overflow-checks = false
+
+[profile.dev]
+opt-level = 1
+debug     = true
