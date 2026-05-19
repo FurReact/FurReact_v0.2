@@ -35,20 +35,26 @@ const SERVO_MAX_US: u32 = 2400;
 const PERIOD_US:    u32 = 20_000;
 const LEDC_BITS:    u8  = 14;
 
-// States, layered from "no contact" to "rich contact":
+// State is determined purely by `stale_ms` — time since the last valid
+// gaze line. "Never received any line" is treated as stale-for-uptime,
+// so a fresh boot naturally lands in Sweep after SWEEP_AFTER_MS.
 //
-//   Sweep   — never received a single USB byte since boot AND boot was
-//             more than SWEEP_AFTER_MS ago. Standalone self-test: slowly
-//             walks each servo across its full active range so you can
-//             eyeball that all four are alive when running off a charger
-//             with no PC attached.
-//   Follow  — got a valid gaze line within FAILSAFE_TIMEOUT_MS. Normal
-//             operating mode.
-//   Center  — was Following but the data went stale (forwarder up but
-//             no gaze, or forwarder just died). Holds all four servos
-//             at SERVO_NEUTRAL_DEG (input == INPUT_CENTER) indefinitely;
-//             we don't auto-disable PWM. To stop the servos drawing
-//             current, physically power them off.
+//   stale_ms < FAILSAFE_TIMEOUT_MS         → Follow
+//                  (active gaze; ears track eyes)
+//   FAILSAFE_TIMEOUT_MS ≤ stale_ms < SWEEP_AFTER_MS
+//                                          → Center
+//                  (brief input gap — hold neutral so we don't twitch
+//                  into Sweep every time the forwarder hiccups for
+//                  a frame)
+//   stale_ms ≥ SWEEP_AFTER_MS              → Sweep
+//                  (standalone self-test: slowly walks each servo
+//                  across its full active range — visible whenever
+//                  we've been disconnected from gaze data for a few
+//                  seconds, including running off a charger / battery
+//                  with no host attached at all)
+//
+// PWM is always being driven in every state — Center isn't a "go limp"
+// mode, it just holds neutral. To silence the servos, cut their power.
 const FAILSAFE_TIMEOUT_MS: u64 = 500;
 const SWEEP_AFTER_MS:      u64 = 3_000;
 
@@ -154,20 +160,26 @@ async fn main(_spawner: embassy_executor::Spawner) {
         .unwrap();
     }
 
-    let _ = IoWrite::write_all(&mut tx, b"BOOT solcatears-fw v0.1\n").await;
     // ESP32-S3 USB-Serial-JTAG only ships TX bytes to the host when its
-    // 64-byte FIFO fills OR we explicitly set WR_DONE via flush(). In
-    // Follow mode the firehose of OK echoes keeps the FIFO churning, but
-    // standalone (Sweep/Center) writes are tens of bytes — they'd sit in
-    // the FIFO indefinitely without an explicit flush.
-    let _ = IoWrite::flush(&mut tx).await;
+    // 64-byte FIFO fills OR we explicitly set WR_DONE via flush(). But
+    // flush() *blocks* until the host actually drains the bytes — and
+    // on battery / USB-without-an-open-tty the host never schedules a
+    // bulk IN, so flush() hangs forever, including this BOOT write
+    // *before the main loop has even started*. With LEDC initialised
+    // to duty_pct=0 that means no PWM signal at all, hence the "no
+    // sweep on battery" symptom. So: every TX gets a tight timeout
+    // around it. When a host shows up, things drain near-instantly.
+    let _ = with_timeout(
+        Duration::from_millis(20),
+        IoWrite::write_all(&mut tx, b"BOOT solcatears-fw v0.1\n"),
+    ).await;
+    let _ = with_timeout(Duration::from_millis(20), IoWrite::flush(&mut tx)).await;
 
     let mut buf = [0u8; 32];
     let mut idx = 0usize;
     let mut rbuf = [0u8; 64];
 
     let boot = Instant::now();
-    let mut ever_received_byte = false;
     let mut last_valid_line: Option<Instant> = None;
     let mut last_targets: [i32; 4] = [INPUT_CENTER; 4];
     let mut current_mode = Mode::Center;
@@ -183,9 +195,6 @@ async fn main(_spawner: embassy_executor::Spawner) {
         let res = with_timeout(Duration::from_millis(20), rx.read(&mut rbuf)).await;
 
         if let Ok(Ok(n)) = res {
-            if n > 0 {
-                ever_received_byte = true;
-            }
             for i in 0..n {
                 let c = rbuf[i];
                 if c == b'\n' {
@@ -200,11 +209,23 @@ async fn main(_spawner: embassy_executor::Spawner) {
                         // Echo for host smoke test (firmware/scripts/echo_test.py).
                         let mut msg: String<128> = String::new();
                         let _ = writeln!(&mut msg, "OK {},{},{},{}", lx, ly, rxv, ry);
-                        let _ = IoWrite::write_all(&mut tx, msg.as_bytes()).await;
-                        let _ = IoWrite::flush(&mut tx).await;
+                        let _ = with_timeout(
+                            Duration::from_millis(20),
+                            IoWrite::write_all(&mut tx, msg.as_bytes()),
+                        ).await;
+                        let _ = with_timeout(
+                            Duration::from_millis(20),
+                            IoWrite::flush(&mut tx),
+                        ).await;
                     } else {
-                        let _ = IoWrite::write_all(&mut tx, b"BAD\n").await;
-                        let _ = IoWrite::flush(&mut tx).await;
+                        let _ = with_timeout(
+                            Duration::from_millis(20),
+                            IoWrite::write_all(&mut tx, b"BAD\n"),
+                        ).await;
+                        let _ = with_timeout(
+                            Duration::from_millis(20),
+                            IoWrite::flush(&mut tx),
+                        ).await;
                     }
                     idx = 0;
                 } else if c != b'\r' {
@@ -221,16 +242,20 @@ async fn main(_spawner: embassy_executor::Spawner) {
         // ── decide state ─────────────────────────────────────────────
         let now = Instant::now();
         let uptime_ms = (now - boot).as_millis();
-        let stale_ms = last_valid_line
-            .map(|t| (now - t).as_millis())
-            .unwrap_or(u64::MAX);
+        // If we've never received a valid line, treat the staleness as
+        // "stale for the whole uptime" — so the boot path naturally goes
+        // Center → Sweep at the same thresholds as a mid-run disconnect.
+        let stale_ms = match last_valid_line {
+            Some(t) => (now - t).as_millis(),
+            None    => uptime_ms,
+        };
 
-        let new_mode = if !ever_received_byte {
-            if uptime_ms < SWEEP_AFTER_MS { Mode::Center } else { Mode::Sweep }
-        } else if stale_ms < FAILSAFE_TIMEOUT_MS {
+        let new_mode = if stale_ms < FAILSAFE_TIMEOUT_MS {
             Mode::Follow
-        } else {
+        } else if stale_ms < SWEEP_AFTER_MS {
             Mode::Center
+        } else {
+            Mode::Sweep
         };
 
         // Announce mode transitions for debugging via the host smoke test.
@@ -240,8 +265,8 @@ async fn main(_spawner: embassy_executor::Spawner) {
                 Mode::Center => b"MODE center\n",
                 Mode::Sweep  => b"MODE sweep\n",
             };
-            let _ = IoWrite::write_all(&mut tx, s).await;
-            let _ = IoWrite::flush(&mut tx).await;
+            let _ = with_timeout(Duration::from_millis(20), IoWrite::write_all(&mut tx, s)).await;
+            let _ = with_timeout(Duration::from_millis(20), IoWrite::flush(&mut tx)).await;
             current_mode = new_mode;
         }
 
@@ -279,8 +304,14 @@ async fn main(_spawner: embassy_executor::Spawner) {
                     "SWEEP t={}s t={},{},{},{}",
                     s, targets[0], targets[1], targets[2], targets[3]
                 );
-                let _ = IoWrite::write_all(&mut tx, msg.as_bytes()).await;
-                let _ = IoWrite::flush(&mut tx).await;
+                let _ = with_timeout(
+                    Duration::from_millis(20),
+                    IoWrite::write_all(&mut tx, msg.as_bytes()),
+                ).await;
+                let _ = with_timeout(
+                    Duration::from_millis(20),
+                    IoWrite::flush(&mut tx),
+                ).await;
             }
         }
     }
