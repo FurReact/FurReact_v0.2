@@ -1,0 +1,24 @@
+[Unit]
+Description=SolCatEars eye-data forwarder (SteamVR gaze → ESP32-S3)
+# Match the deferred usb-host unit: don't fight Steam / SteamVR / login
+# during their startup. The binary has its own retry loop, so even if it
+# starts before vrserver is ready it just spins until it shows up.
+After=multi-user.target solcatears-usb-host.service
+Wants=solcatears-usb-host.service
+
+[Service]
+Type=simple
+User=steamos
+# raw libusb access goes through /dev/bus/usb/* which is root:input on
+# SteamOS. steamos is already in `input`; declaring it as a supplementary
+# group here makes the unit robust to that changing.
+SupplementaryGroups=input
+ExecStart=/home/steamos/work/eye_data_forwarder/target/release/eye_data_forwarder
+Restart=always
+RestartSec=2
+# Don't spam restart-storm if the binary segfaults repeatedly.
+StartLimitIntervalSec=60
+StartLimitBurst=20
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,24 @@
+[Unit]
+Description=Switch Frame USB-C role to host for SolCatEars
+# Run as late as practical: after multi-user.target's whole activation
+# chain is done (so any boot-time use of the USB-C port in device role —
+# console / development connect / etc — still works). The pair
+#   After=multi-user.target
+#   WantedBy=multi-user.target
+# does NOT cycle because WantedBy installs a soft Wants= dep, and Wants
+# does not impose ordering; only Requires/After do. So multi-user.target
+# reaches `active` first, *then* pulls us in.
+After=multi-user.target
+ConditionPathExists=/sys/kernel/debug/usb/a600000.usb/mode
+
+[Service]
+Type=oneshot
+# The role file resets to `device` on every reboot. Writing `host` here
+# also re-triggers enumeration; if the ESP was already attached at boot
+# in the wrong role it may need a physical replug — that's a Linux/dwc3
+# limitation, not something we can fix from userspace.
+ExecStart=/bin/sh -c 'echo host > /sys/kernel/debug/usb/a600000.usb/mode'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

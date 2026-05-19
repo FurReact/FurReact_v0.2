@@ -22,8 +22,13 @@ Steam Frame eye tracking → cat ear servos via USB serial.
 - `SERVO_NEUTRAL_DEG=90`, pulse range 500–2400 µs.
 - Default: each eye drives same-side ear, no deadzone, no smoothing. Swap/invert per-axis via `INVERT_*` and `SWAP_EYES` consts.
 
-## Failsafe
-- If no valid line for `FAILSAFE_TIMEOUT_MS` (default 500 ms), **go limp**: stop LEDC output so servos draw no current.
+## State machine (firmware)
+Three modes layered from "no contact" to "rich contact":
+- **Sweep** — no USB byte ever received since boot AND uptime > `SWEEP_AFTER_MS` (3 s default). Slow asymmetric-triangle self-test across each servo's full range. Visible when running off a charger with no host.
+- **Follow** — got a valid gaze line within `FAILSAFE_TIMEOUT_MS` (500 ms default). Normal operating mode.
+- **Center** — anything else (stale data, or just-booted with no input yet). Holds all four servos at `SERVO_NEUTRAL_DEG` indefinitely — the firmware never auto-disables PWM. Physically power off the servo rail if you want them silent.
+
+Transitions emit a single ASCII line over USB (`MODE follow` / `MODE center` / `MODE sweep`) for host-side observability.
 
 ## Toolchain
 - `espup` + `rust-toolchain.toml` pins the `esp` channel. Build env: `source ~/export-esp.sh`.
@@ -34,7 +39,7 @@ Steam Frame eye tracking → cat ear servos via USB serial.
 
 ## Host-side smoke test
 - `python3 firmware/scripts/echo_test.py` — opens `/dev/cu.usbmodem101` raw (stdlib-only, no pyserial) and asserts OK/BAD/LIMP responses.
-- Firmware echoes one line per input: `OK lx,ly,rx,ry us=p0,p1,p2,p3`, `BAD`, or `LIMP` on failsafe.
+- Firmware echoes one line per input: `OK lx,ly,rx,ry` or `BAD`. State-machine transitions print `MODE <follow|center|sweep|limp>`.
 
 
 

@@ -14,7 +14,7 @@
 use std::ffi::{c_char, c_int, c_void};
 use std::ptr;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use libloading::{Library, Symbol};
 use rusb::UsbContext;
@@ -255,7 +255,7 @@ impl Serial {
         }
         let iface_data = iface_data.ok_or("no CDC Data interface with bulk OUT")?;
 
-        let mut handle = dev.open().map_err(|e| format!("open: {e}"))?;
+        let handle = dev.open().map_err(|e| format!("open: {e}"))?;
         let _ = handle.set_auto_detach_kernel_driver(true);
         let _ = handle.set_active_configuration(1);
 
@@ -307,6 +307,8 @@ impl Drop for Serial {
 }
 
 // ═════ Mapping + main loop ════════════════════════════════════════════════
+const PROTOCOL_CENTER: i32 = 512;
+
 fn axis_to_protocol(v: f32) -> i32 {
     // Gaze component [-1,1] → 0..1024 (center 512). ESP firmware clamps
     // further to its physical range.
@@ -314,29 +316,113 @@ fn axis_to_protocol(v: f32) -> i32 {
     s.clamp(0.0, 1024.0) as i32
 }
 
-fn main() {
-    let vr = OpenVR::init().unwrap_or_else(|e| {
-        eprintln!("openvr init failed: {e}");
-        std::process::exit(1);
-    });
-    let mut ser = Serial::open().unwrap_or_else(|e| {
-        eprintln!("serial open failed: {e}");
-        std::process::exit(1);
-    });
+const RETRY_BACKOFF:    Duration = Duration::from_secs(2);
+const HEARTBEAT_PERIOD: Duration = Duration::from_secs(1);
+const USB_MODE_PATH:    &str = "/sys/kernel/debug/usb/a600000.usb/mode";
+
+/// Best-effort check that the Frame's USB-C port is in host mode. Prints a
+/// pointed warning if the role file says otherwise. Silently no-ops if the
+/// file doesn't exist (not a Frame) or we can't read it (debugfs perms).
+fn warn_if_not_host_mode() {
+    match std::fs::read_to_string(USB_MODE_PATH) {
+        Ok(s) => {
+            let mode = s.trim();
+            if mode != "host" {
+                eprintln!(
+                    "[fwd] WARNING: USB-C role is {:?}, expected \"host\". The ESP \
+                     will not enumerate until you run:\n  \
+                     sudo sh -c 'echo host > {}'\n  \
+                     (and then physically replug the ESP, per the dwc3 stuck-state \
+                     thing).",
+                    mode, USB_MODE_PATH
+                );
+            }
+        }
+        Err(_) => {
+            // Not a Frame, or steamos can't read debugfs — nothing useful to say.
+        }
+    }
+}
+
+fn run_session() -> Result<(), String> {
+    let vr = OpenVR::init()?;
+    let mut ser = Serial::open().map_err(|e| {
+        // If we can't find the ESP, the most common cause on the Frame is
+        // the port still being in `device` role. Surface that hint inline.
+        warn_if_not_host_mode();
+        e
+    })?;
+    eprintln!("[fwd] session up: openvr + esp serial ready");
+
+    let mut last_heartbeat = Instant::now();
+    let mut last_state = "";
 
     loop {
         let pose = vr.latest_eye_pose();
-        let lx = axis_to_protocol(pose.gaze_vec[0].v[0]);
-        let ly = axis_to_protocol(pose.gaze_vec[0].v[1]);
-        let rx = axis_to_protocol(pose.gaze_vec[1].v[0]);
-        let ry = axis_to_protocol(pose.gaze_vec[1].v[1]);
+
+        // Only send centered when the headset isn't on a head. Blinking is
+        // a normal, frequent event — chasing the gaze through a blink looks
+        // more natural than snapping the ears to neutral every time.
+        let (state, lx, ly, rx, ry) = if !pose.eyes_in_headset {
+            ("no-eyes", PROTOCOL_CENTER, PROTOCOL_CENTER, PROTOCOL_CENTER, PROTOCOL_CENTER)
+        } else {
+            (
+                "follow",
+                axis_to_protocol(pose.gaze_vec[0].v[0]),
+                axis_to_protocol(pose.gaze_vec[0].v[1]),
+                axis_to_protocol(pose.gaze_vec[1].v[0]),
+                axis_to_protocol(pose.gaze_vec[1].v[1]),
+            )
+        };
 
         let msg = format!("{:04},{:04},{:04},{:04}\n", lx, ly, rx, ry);
-        if let Err(e) = ser.write(msg.as_bytes()) {
-            eprintln!("serial write: {e}");
-        }
+        ser.write(msg.as_bytes())
+            .map_err(|e| format!("serial write: {e}"))?;
         ser.drain();
 
+        // Rate-limited heartbeat — also fires immediately on state changes
+        // so you see follow ↔ no-eyes transitions without waiting for the
+        // next tick.
+        let now = Instant::now();
+        let state_changed = state != last_state;
+        if state_changed || now.duration_since(last_heartbeat) >= HEARTBEAT_PERIOD {
+            eprintln!("[fwd] state={} tx={}", state, msg.trim_end());
+            last_heartbeat = now;
+            last_state = state;
+        }
+
         thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn main() {
+    // Outer retry loop: any failure (SteamVR not yet up, ESP unplugged,
+    // bulk write error mid-session, etc.) ends the inner session, sleeps
+    // briefly, and re-tries. systemd will Restart=always us if the
+    // process itself dies (e.g. segfault from a SteamVR crash).
+    //
+    // Log discipline: print on the first occurrence of an error, then
+    // suppress identical repeats unless ≥10 s have passed. Keeps the
+    // journal readable while the headset is e.g. asleep for hours.
+    const ERROR_REPEAT_PERIOD: Duration = Duration::from_secs(10);
+    let mut last_err = String::new();
+    let mut last_err_logged: Option<Instant> = None;
+    loop {
+        match run_session() {
+            Ok(()) => {} // unreachable; run_session loops forever on success
+            Err(e) => {
+                let now = Instant::now();
+                let should_log = e != last_err
+                    || last_err_logged
+                        .map(|t| now.duration_since(t) >= ERROR_REPEAT_PERIOD)
+                        .unwrap_or(true);
+                if should_log {
+                    eprintln!("[fwd] session ended: {e}");
+                    last_err = e;
+                    last_err_logged = Some(now);
+                }
+            }
+        }
+        thread::sleep(RETRY_BACKOFF);
     }
 }
