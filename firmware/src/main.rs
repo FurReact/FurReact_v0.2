@@ -70,10 +70,10 @@ struct ServoRoute {
 // (`invert`), and its own neutral/deflection so individual servos can
 // be trimmed to the mechanics they're bolted to.
 const ROUTES: [ServoRoute; 4] = [
-    ServoRoute { enabled: true, source: InputAxis::LeftX,  invert: false, neutral_deg: 90, deflection_deg: 30 },
-    ServoRoute { enabled: true, source: InputAxis::LeftY,  invert: false, neutral_deg: 90, deflection_deg: 30 },
-    ServoRoute { enabled: true, source: InputAxis::RightX, invert: false, neutral_deg: 90, deflection_deg: 30 },
-    ServoRoute { enabled: true, source: InputAxis::RightY, invert: false, neutral_deg: 90, deflection_deg: 30 },
+    ServoRoute { enabled: true, source: InputAxis::RightY,  invert: true, neutral_deg: 90, deflection_deg: 30 },
+    ServoRoute { enabled: true, source: InputAxis::LeftX,  invert: true, neutral_deg: 90, deflection_deg: 30 },
+    ServoRoute { enabled: true, source: InputAxis::RightX, invert: true, neutral_deg: 90, deflection_deg: 30 },
+    ServoRoute { enabled: true, source: InputAxis::LeftY, invert: true, neutral_deg: 90, deflection_deg: 30 },
 ];
 
 // State is determined purely by `stale_ms` — time since the last valid
