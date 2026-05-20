@@ -161,6 +161,18 @@ fn parse_line(buf: &[u8]) -> Option<(i32, i32, i32, i32)> {
     Some((a, b, c, d))
 }
 
+// USB TX is observability only. Bound every write+flush by this timeout:
+// the ESP32-S3 USB-Serial-JTAG flush() blocks until the host drains the
+// FIFO, and on battery / with no open tty no host ever does — an
+// unbounded flush would wedge us before PWM even starts. Errors and
+// timeouts are deliberately ignored.
+const TX_TIMEOUT: Duration = Duration::from_millis(20);
+
+async fn emit<W: IoWrite>(tx: &mut W, bytes: &[u8]) {
+    let _ = with_timeout(TX_TIMEOUT, tx.write_all(bytes)).await;
+    let _ = with_timeout(TX_TIMEOUT, tx.flush()).await;
+}
+
 #[esp_rtos::main]
 async fn main(_spawner: embassy_executor::Spawner) {
     let p = esp_hal::init(esp_hal::Config::default().with_cpu_clock(CpuClock::max()));
@@ -196,20 +208,7 @@ async fn main(_spawner: embassy_executor::Spawner) {
         .unwrap();
     }
 
-    // ESP32-S3 USB-Serial-JTAG only ships TX bytes to the host when its
-    // 64-byte FIFO fills OR we explicitly set WR_DONE via flush(). But
-    // flush() *blocks* until the host actually drains the bytes — and
-    // on battery / USB-without-an-open-tty the host never schedules a
-    // bulk IN, so flush() hangs forever, including this BOOT write
-    // *before the main loop has even started*. With LEDC initialised
-    // to duty_pct=0 that means no PWM signal at all, hence the "no
-    // sweep on battery" symptom. So: every TX gets a tight timeout
-    // around it. When a host shows up, things drain near-instantly.
-    let _ = with_timeout(
-        Duration::from_millis(20),
-        IoWrite::write_all(&mut tx, b"BOOT solcatears-fw v0.1\n"),
-    ).await;
-    let _ = with_timeout(Duration::from_millis(20), IoWrite::flush(&mut tx)).await;
+    emit(&mut tx, b"BOOT solcatears-fw v0.1\n").await;
 
     let mut buf = [0u8; 32];
     let mut idx = 0usize;
@@ -231,8 +230,7 @@ async fn main(_spawner: embassy_executor::Spawner) {
         let res = with_timeout(Duration::from_millis(20), rx.read(&mut rbuf)).await;
 
         if let Ok(Ok(n)) = res {
-            for i in 0..n {
-                let c = rbuf[i];
+            for &c in &rbuf[..n] {
                 if c == b'\n' {
                     if let Some((lx, ly, rxv, ry)) = parse_line(&buf[..idx]) {
                         // Stored in canonical input order; ROUTES decides
@@ -243,23 +241,9 @@ async fn main(_spawner: embassy_executor::Spawner) {
                         // Echo for host smoke test (firmware/scripts/echo_test.py).
                         let mut msg: String<128> = String::new();
                         let _ = writeln!(&mut msg, "OK {},{},{},{}", lx, ly, rxv, ry);
-                        let _ = with_timeout(
-                            Duration::from_millis(20),
-                            IoWrite::write_all(&mut tx, msg.as_bytes()),
-                        ).await;
-                        let _ = with_timeout(
-                            Duration::from_millis(20),
-                            IoWrite::flush(&mut tx),
-                        ).await;
+                        emit(&mut tx, msg.as_bytes()).await;
                     } else {
-                        let _ = with_timeout(
-                            Duration::from_millis(20),
-                            IoWrite::write_all(&mut tx, b"BAD\n"),
-                        ).await;
-                        let _ = with_timeout(
-                            Duration::from_millis(20),
-                            IoWrite::flush(&mut tx),
-                        ).await;
+                        emit(&mut tx, b"BAD\n").await;
                     }
                     idx = 0;
                 } else if c != b'\r' {
@@ -299,8 +283,7 @@ async fn main(_spawner: embassy_executor::Spawner) {
                 Mode::Center => b"MODE center\n",
                 Mode::Sweep  => b"MODE sweep\n",
             };
-            let _ = with_timeout(Duration::from_millis(20), IoWrite::write_all(&mut tx, s)).await;
-            let _ = with_timeout(Duration::from_millis(20), IoWrite::flush(&mut tx)).await;
+            emit(&mut tx, s).await;
             current_mode = new_mode;
         }
 
@@ -348,14 +331,7 @@ async fn main(_spawner: embassy_executor::Spawner) {
                     "SWEEP t={}s t={},{},{},{}",
                     s, targets[0], targets[1], targets[2], targets[3]
                 );
-                let _ = with_timeout(
-                    Duration::from_millis(20),
-                    IoWrite::write_all(&mut tx, msg.as_bytes()),
-                ).await;
-                let _ = with_timeout(
-                    Duration::from_millis(20),
-                    IoWrite::flush(&mut tx),
-                ).await;
+                emit(&mut tx, msg.as_bytes()).await;
             }
         }
     }

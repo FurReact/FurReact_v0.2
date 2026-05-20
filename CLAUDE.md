@@ -17,16 +17,20 @@ Steam Frame eye tracking → cat ear servos via USB serial.
 - Input range: nominal 0–1024; physical 256–768. Center ≈ 512.
 
 ## Mapping (all configurable at top of `firmware/src/main.rs`)
-- `INPUT_MIN=256, INPUT_MAX=768, INPUT_CENTER=512`
-- `EAR_DEFLECTION_DEG=30` — max deflection from servo neutral (90°).
-- `SERVO_NEUTRAL_DEG=90`, pulse range 500–2400 µs.
-- Default: each eye drives same-side ear, no deadzone, no smoothing. Swap/invert per-axis via `INVERT_*` and `SWAP_EYES` consts.
+- Input signal (shared): `INPUT_MIN=256, INPUT_MAX=768, INPUT_CENTER=512`.
+- Servo electrical (shared): pulse range 500–2400 µs, 50 Hz, 14-bit duty.
+- **Per-channel routing — `ROUTES: [ServoRoute; 4]`.** One entry per *physical output channel* in hardware order (`[0]`=ch0/GPIO1/D0 … `[3]`=ch3/GPIO4/D3). Each `ServoRoute` is:
+  - `enabled` — `false` leaves that channel's PWM idle (duty 0, no pulses) in every mode. For bench bring-up one servo at a time.
+  - `source: InputAxis` — which parsed input (`LeftX/LeftY/RightX/RightY`, the canonical `parse_line` order) drives this output. This is the EE-rewiring knob and **subsumes the old `SWAP_EYES`** (e.g. point the left outputs at `RightX/RightY`).
+  - `invert` — flip travel direction (**replaces the old `INVERT_*` flags**).
+  - `neutral_deg` (rest, 0–180; 90 = mechanical center) and `deflection_deg` (max swing from neutral) — now per-channel, so each servo trims to its own mechanics. **Replaces the old global `SERVO_NEUTRAL_DEG`/`EAR_DEFLECTION_DEG`.**
+- Default: each eye drives same-side ear, all enabled, no invert, neutral 90° / deflection 30°, no deadzone, no smoothing.
 
 ## State machine (firmware)
 Three modes layered from "no contact" to "rich contact":
 - **Sweep** — no USB byte ever received since boot AND uptime > `SWEEP_AFTER_MS` (3 s default). Slow asymmetric-triangle self-test across each servo's full range. Visible when running off a charger with no host.
 - **Follow** — got a valid gaze line within `FAILSAFE_TIMEOUT_MS` (500 ms default). Normal operating mode.
-- **Center** — anything else (stale data, or just-booted with no input yet). Holds all four servos at `SERVO_NEUTRAL_DEG` indefinitely — the firmware never auto-disables PWM. Physically power off the servo rail if you want them silent.
+- **Center** — anything else (stale data, or just-booted with no input yet). Holds each servo at its `ROUTES[n].neutral_deg` indefinitely — the firmware never auto-disables PWM. Physically power off the servo rail (or set `enabled: false`) if you want a channel silent.
 
 Transitions emit a single ASCII line over USB (`MODE follow` / `MODE center` / `MODE sweep`) for host-side observability.
 
