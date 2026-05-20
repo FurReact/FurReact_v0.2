@@ -23,17 +23,58 @@ use heapless::String;
 esp_bootloader_esp_idf::esp_app_desc!();
 
 // ─────────────── TUNABLES ───────────────
+// Input signal: parse_line yields four values in a fixed canonical
+// order — left_x, left_y, right_x, right_y. Nominal 0–1024, physical
+// 256–768, center ≈ 512.
 const INPUT_MIN:    i32 = 256;
 const INPUT_MAX:    i32 = 768;
 const INPUT_CENTER: i32 = 512;
 
-const EAR_DEFLECTION_DEG: i32 = 30;
-const SERVO_NEUTRAL_DEG:  i32 = 90;
-
+// Servo electrical limits (shared by all four channels).
 const SERVO_MIN_US: u32 = 500;
 const SERVO_MAX_US: u32 = 2400;
 const PERIOD_US:    u32 = 20_000;
 const LEDC_BITS:    u8  = 14;
+
+/// One of the four values parse_line produces, in its canonical order.
+#[derive(Copy, Clone)]
+enum InputAxis {
+    LeftX  = 0,
+    LeftY  = 1,
+    RightX = 2,
+    RightY = 3,
+}
+
+/// How one physical servo channel turns an input axis into an angle.
+struct ServoRoute {
+    /// Set false to leave this channel's PWM idle (duty 0, no pulses) in
+    /// every mode — handy for bringing up one servo at a time.
+    enabled: bool,
+    /// Which parsed input drives this servo. Re-point this to rewire
+    /// eyes↔ears or pan↔tilt however the harness was actually soldered
+    /// (replaces the old SWAP_EYES).
+    source: InputAxis,
+    /// Flip travel direction (replaces the old INVERT_* flags).
+    invert: bool,
+    /// Rest angle, 0–180. 90 = servo mechanical center.
+    neutral_deg: i32,
+    /// Max swing from neutral at full input deflection, in degrees.
+    deflection_deg: i32,
+}
+
+// ── SERVO ROUTING — the EE-wiring knob ──
+// One entry per physical output channel, in hardware order:
+//   [0] ch0 / GPIO1 / D0      [2] ch2 / GPIO3 / D2
+//   [1] ch1 / GPIO2 / D1      [3] ch3 / GPIO4 / D3
+// Each output picks its input axis (`source`), its direction
+// (`invert`), and its own neutral/deflection so individual servos can
+// be trimmed to the mechanics they're bolted to.
+const ROUTES: [ServoRoute; 4] = [
+    ServoRoute { enabled: true, source: InputAxis::LeftX,  invert: false, neutral_deg: 90, deflection_deg: 30 },
+    ServoRoute { enabled: true, source: InputAxis::LeftY,  invert: false, neutral_deg: 90, deflection_deg: 30 },
+    ServoRoute { enabled: true, source: InputAxis::RightX, invert: false, neutral_deg: 90, deflection_deg: 30 },
+    ServoRoute { enabled: true, source: InputAxis::RightY, invert: false, neutral_deg: 90, deflection_deg: 30 },
+];
 
 // State is determined purely by `stale_ms` — time since the last valid
 // gaze line. "Never received any line" is treated as stale-for-uptime,
@@ -62,24 +103,19 @@ const SWEEP_AFTER_MS:      u64 = 3_000;
 // are coprime-ish so the 4D trajectory doesn't repeat in ~minutes.
 const SWEEP_PERIODS_MS: [u64; 4] = [3_700, 5_100, 4_300, 6_100];
 
-const INVERT_LEFT_X:  bool = false;
-const INVERT_LEFT_Y:  bool = false;
-const INVERT_RIGHT_X: bool = false;
-const INVERT_RIGHT_Y: bool = false;
-const SWAP_EYES:      bool = false;
 // ────────────────────────────────────────
 
 const MAX_DUTY: u32 = 1 << LEDC_BITS;
 
-fn pulse_us_from_input(v: i32, invert: bool) -> u32 {
+fn pulse_us_from_input(v: i32, route: &ServoRoute) -> u32 {
     let v = v.clamp(INPUT_MIN, INPUT_MAX);
     let mut off = v - INPUT_CENTER;
-    if invert {
+    if route.invert {
         off = -off;
     }
     let half = ((INPUT_MAX - INPUT_MIN) / 2).max(1);
-    let deflection = (off * EAR_DEFLECTION_DEG) / half;
-    let angle = (SERVO_NEUTRAL_DEG + deflection).clamp(0, 180) as u32;
+    let deflection = (off * route.deflection_deg) / half;
+    let angle = (route.neutral_deg + deflection).clamp(0, 180) as u32;
     SERVO_MIN_US + (SERVO_MAX_US - SERVO_MIN_US) * angle / 180
 }
 
@@ -198,11 +234,9 @@ async fn main(_spawner: embassy_executor::Spawner) {
             for i in 0..n {
                 let c = rbuf[i];
                 if c == b'\n' {
-                    if let Some((mut lx, mut ly, mut rxv, mut ry)) = parse_line(&buf[..idx]) {
-                        if SWAP_EYES {
-                            core::mem::swap(&mut lx, &mut rxv);
-                            core::mem::swap(&mut ly, &mut ry);
-                        }
+                    if let Some((lx, ly, rxv, ry)) = parse_line(&buf[..idx]) {
+                        // Stored in canonical input order; ROUTES decides
+                        // which output channel each one ends up driving.
                         last_targets = [lx, ly, rxv, ry];
                         last_valid_line = Some(Instant::now());
 
@@ -271,23 +305,33 @@ async fn main(_spawner: embassy_executor::Spawner) {
         }
 
         // ── apply ────────────────────────────────────────────────────
-        let targets = match new_mode {
-            Mode::Follow => last_targets,
+        // Resolve a per-OUTPUT input value. Follow/Center work in input
+        // space and route each output to its `source`; Sweep walks each
+        // output through its own range directly (a per-servo self-test).
+        let targets: [i32; 4] = match new_mode {
+            Mode::Follow => [
+                last_targets[ROUTES[0].source as usize],
+                last_targets[ROUTES[1].source as usize],
+                last_targets[ROUTES[2].source as usize],
+                last_targets[ROUTES[3].source as usize],
+            ],
             Mode::Center => [INPUT_CENTER; 4],
             Mode::Sweep  => sweep_targets(uptime_ms),
         };
 
         if targets != last_applied {
-            let us = [
-                pulse_us_from_input(targets[0], INVERT_LEFT_X),
-                pulse_us_from_input(targets[1], INVERT_LEFT_Y),
-                pulse_us_from_input(targets[2], INVERT_RIGHT_X),
-                pulse_us_from_input(targets[3], INVERT_RIGHT_Y),
-            ];
-            let _ = ch0.set_duty_hw(duty_for_pulse_us(us[0]));
-            let _ = ch1.set_duty_hw(duty_for_pulse_us(us[1]));
-            let _ = ch2.set_duty_hw(duty_for_pulse_us(us[2]));
-            let _ = ch3.set_duty_hw(duty_for_pulse_us(us[3]));
+            // Disabled channels get duty 0 (no pulses) in every mode.
+            let duty = |o: usize| -> u32 {
+                if ROUTES[o].enabled {
+                    duty_for_pulse_us(pulse_us_from_input(targets[o], &ROUTES[o]))
+                } else {
+                    0
+                }
+            };
+            let _ = ch0.set_duty_hw(duty(0));
+            let _ = ch1.set_duty_hw(duty(1));
+            let _ = ch2.set_duty_hw(duty(2));
+            let _ = ch3.set_duty_hw(duty(3));
             last_applied = targets;
         }
 
